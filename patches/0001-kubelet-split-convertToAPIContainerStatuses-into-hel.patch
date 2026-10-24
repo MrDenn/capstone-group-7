@@ -1,0 +1,1105 @@
+From 86736c3290d79f08fc0beaaf5f8c410683945d7f Mon Sep 17 00:00:00 2001
+From: MrDenn <den.shaikhatarov@gmail.com>
+Date: Fri, 16 Oct 2026 17:47:59 +0200
+Subject: [PATCH 1/2] kubelet: split convertToAPIContainerStatuses into helpers
+
+Capstone 2IRR80 team 7 demonstration refactor (not for upstream).
+Moves the three closures and the four steps of the function into
+named functions in kubelet_container_status.go. No behaviour change.
+---
+ pkg/kubelet/kubelet_container_status.go | 573 ++++++++++++++++++++++++
+ pkg/kubelet/kubelet_pods.go             | 481 +-------------------
+ 2 files changed, 583 insertions(+), 471 deletions(-)
+ create mode 100644 pkg/kubelet/kubelet_container_status.go
+
+diff --git a/pkg/kubelet/kubelet_container_status.go b/pkg/kubelet/kubelet_container_status.go
+new file mode 100644
+index 00000000000..7e2f2c2dd9a
+--- /dev/null
++++ b/pkg/kubelet/kubelet_container_status.go
+@@ -0,0 +1,573 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package kubelet
++
++// Helpers of convertToAPIContainerStatuses (kubelet_pods.go). Each step of the
++// conversion and each former closure of that function is a separate function here.
++
++import (
++	"context"
++	"fmt"
++	"sort"
++
++	v1 "k8s.io/api/core/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/util/sets"
++	utilfeature "k8s.io/apiserver/pkg/util/feature"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++	"k8s.io/klog/v2"
++	"k8s.io/kubernetes/pkg/features"
++	"k8s.io/kubernetes/pkg/kubelet/cm"
++	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
++	"k8s.io/kubernetes/pkg/kubelet/kuberuntime"
++)
++
++// Step 1: default statuses.
++
++// defaultContainerStatuses returns a status for every container: the default
++// Waiting status, or the previous status if the container was terminated.
++func defaultContainerStatuses(logger klog.Logger, containers []v1.Container, oldStatuses map[string]v1.ContainerStatus, hasInitContainers, supportsRRO bool) map[string]*v1.ContainerStatus {
++	statuses := make(map[string]*v1.ContainerStatus, len(containers))
++	defaultWaitingState := v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}}
++	if hasInitContainers {
++		defaultWaitingState = v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: PodInitializing}}
++	}
++
++	for _, container := range containers {
++		status := &v1.ContainerStatus{
++			Name:  container.Name,
++			Image: container.Image,
++			State: defaultWaitingState,
++		}
++		// status.VolumeMounts cannot be propagated from kubecontainer.Status
++		// because the CRI API is unaware of the volume names.
++		if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
++			status.VolumeMounts = volumeMountStatuses(logger, container, supportsRRO)
++		}
++		oldStatus, found := oldStatuses[container.Name]
++		if found {
++			if oldStatus.State.Terminated != nil {
++				status = &oldStatus
++			} else {
++				// Apply some values from the old statuses as the default values.
++				status.RestartCount = oldStatus.RestartCount
++				status.LastTerminationState = oldStatus.LastTerminationState
++			}
++		}
++		statuses[container.Name] = status
++	}
++	return statuses
++}
++
++// volumeMountStatuses returns the volume mount statuses of a container, including
++// the recursive read-only mode of its read-only mounts.
++func volumeMountStatuses(logger klog.Logger, container v1.Container, supportsRRO bool) []v1.VolumeMountStatus {
++	var mounts []v1.VolumeMountStatus
++	for _, vol := range container.VolumeMounts {
++		volStatus := v1.VolumeMountStatus{
++			Name:      vol.Name,
++			MountPath: vol.MountPath,
++			ReadOnly:  vol.ReadOnly,
++		}
++		if vol.ReadOnly {
++			rroMode := v1.RecursiveReadOnlyDisabled
++			if b, err := resolveRecursiveReadOnly(vol, supportsRRO); err != nil {
++				logger.Error(err, "failed to resolve recursive read-only mode", "mode", *vol.RecursiveReadOnly)
++			} else if b {
++				if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
++					rroMode = v1.RecursiveReadOnlyEnabled
++				} else {
++					logger.Error(nil, "recursive read-only mount needs feature gate to be enabled",
++						"featureGate", features.RecursiveReadOnlyMounts)
++				}
++			}
++			volStatus.RecursiveReadOnly = &rroMode // Disabled or Enabled
++		}
++		mounts = append(mounts, volStatus)
++	}
++	return mounts
++}
++
++// Step 2: containers that disappeared from the runtime.
++
++// inferMissingContainerTerminations handles containers that the runtime does not
++// report any more. If such a container was running before, it is shown as
++// terminated instead of waiting, so that the pod does not go back to Pending.
++func inferMissingContainerTerminations(pod *v1.Pod, podStatus *kubecontainer.PodStatus, containers []v1.Container, oldStatuses map[string]v1.ContainerStatus, statuses map[string]*v1.ContainerStatus, hasInitContainers, podRestarting bool) {
++	for _, container := range containers {
++		if podStatus.FindContainerStatusByName(container.Name) != nil {
++			continue
++		}
++		// if no container is found, then assuming it should be waiting seems plausible, but the status code requires
++		// that a previous termination be present.  If we're offline long enough or something removed the container, then
++		// the previous termination may not be present.  This next code block ensures that if the container was previously running
++		// then when that container status disappears, we can infer that it terminated even if we don't know the status code.
++		// By setting the lasttermination state we are able to leave the container status waiting and present more accurate
++		// data via the API.
++		oldStatus, ok := oldStatuses[container.Name]
++		if !ok {
++			continue
++		}
++
++		// If the container is missing, RestartAllContainers in place, and previous status is not waiting, then the container
++		// is removed from runtime. It should be considered Waiting.
++		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) && podRestarting && oldStatus.State.Waiting == nil {
++			markRemovedByRestartAll(statuses[container.Name], oldStatus)
++			continue
++		}
++
++		if oldStatus.State.Terminated != nil {
++			// if the old container status was terminated, the lasttermination status is correct
++			continue
++		}
++		if oldStatus.State.Running == nil {
++			// if the old container status isn't running, then waiting is an appropriate status and we have nothing to do
++			continue
++		}
++
++		// If we're here, we know the pod was previously running, but doesn't have a terminated status.
++		status := statuses[container.Name]
++		if !isDefaultWaitingStatus(status, hasInitContainers) {
++			// the status was written, don't override
++			continue
++		}
++		if status.LastTerminationState.Terminated != nil {
++			// if we already have a termination state, nothing to do
++			continue
++		}
++
++		// setting this value ensures that we show as stopped here, not as waiting:
++		// https://github.com/kubernetes/kubernetes/blob/90c9f7b3e198e82a756a68ffeac978a00d606e55/pkg/kubelet/kubelet_pods.go#L1440-L1445
++		// This prevents the pod from becoming pending
++		status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
++			Reason:   kubecontainer.ContainerReasonStatusUnknown,
++			Message:  "The container could not be located when the pod was deleted.  The container used to be Running",
++			ExitCode: 137,
++		}
++
++		// If the pod was not deleted, then it's been restarted. Increment restart count.
++		if pod.DeletionTimestamp == nil {
++			status.RestartCount += 1
++		}
++	}
++}
++
++// markRemovedByRestartAll shows a container that RestartAllContainers removed
++// from the runtime as Waiting, with a matching LastTerminationState.
++func markRemovedByRestartAll(status *v1.ContainerStatus, oldStatus v1.ContainerStatus) {
++	status.State.Waiting = &v1.ContainerStateWaiting{
++		Reason:  RestartingAllContainers,
++		Message: "The container is removed because RestartAllContainers in place",
++	}
++	status.State.Terminated = nil
++	status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
++		Reason:   RestartingAllContainers,
++		Message:  "The container is removed because RestartAllContainers in place",
++		ExitCode: 137,
++	}
++	status.RestartCount = oldStatus.RestartCount + 1
++}
++
++// isDefaultWaitingStatus reports whether status is still the default Waiting
++// status set by defaultContainerStatuses.
++func isDefaultWaitingStatus(status *v1.ContainerStatus, hasInitContainers bool) bool {
++	reason := ContainerCreating
++	if hasInitContainers {
++		reason = PodInitializing
++	}
++	return status.State.Waiting != nil && status.State.Waiting.Reason == reason
++}
++
++// Step 3: statuses reported by the container runtime.
++
++// applyRuntimeContainerStatuses overwrites the default statuses with the
++// statuses that the container runtime reports. The newest runtime status of a
++// container becomes its State and the one before it its LastTerminationState.
++func (kl *Kubelet) applyRuntimeContainerStatuses(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, oldStatuses map[string]v1.ContainerStatus, statuses map[string]*v1.ContainerStatus, imageVolumeNames sets.Set[string], podRestarting bool) {
++	// Copy the slice before sorting it
++	containerStatusesCopy := make([]*kubecontainer.Status, len(podStatus.ContainerStatuses))
++	copy(containerStatusesCopy, podStatus.ContainerStatuses)
++
++	// Make the latest container status comes first.
++	sort.Sort(sort.Reverse(kubecontainer.SortContainerStatusesByCreationTime(containerStatusesCopy)))
++	// Set container statuses according to the statuses seen in pod status
++	containerSeen := map[string]int{}
++	for _, cStatus := range containerStatusesCopy {
++		cName := cStatus.Name
++		if _, ok := statuses[cName]; !ok {
++			// This would also ignore the infra container.
++			continue
++		}
++		if containerSeen[cName] >= 2 {
++			continue
++		}
++		var oldStatusPtr *v1.ContainerStatus
++		if oldStatus, ok := oldStatuses[cName]; ok {
++			oldStatusPtr = &oldStatus
++		}
++		status := kl.convertContainerStatus(ctx, pod, cStatus, oldStatusPtr, imageVolumeNames, podRestarting)
++		addFeatureGatedStatusFields(pod, status, cStatus, oldStatuses)
++
++		if containerSeen[cName] == 0 {
++			statuses[cName] = status
++		} else {
++			statuses[cName].LastTerminationState = status.State
++		}
++		containerSeen[cName] = containerSeen[cName] + 1
++	}
++}
++
++// addFeatureGatedStatusFields fills the status fields that only exist behind a
++// feature gate: Started (kept from the old status), Resources,
++// AllocatedResources, User and StopSignal.
++func addFeatureGatedStatusFields(pod *v1.Pod, status *v1.ContainerStatus, cStatus *kubecontainer.Status, oldStatuses map[string]v1.ContainerStatus) {
++	if !utilfeature.DefaultFeatureGate.Enabled(features.ChangeContainerStatusOnKubeletRestart) {
++		if cStatus.State == kubecontainer.ContainerStateRunning {
++			if oldStatus, ok := oldStatuses[status.Name]; ok && oldStatus.Started != nil {
++				status.Started = oldStatus.Started
++			}
++		}
++	}
++
++	if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
++		allocatedContainer := kubecontainer.GetContainerSpec(pod, cStatus.Name)
++		if allocatedContainer != nil {
++			// status.Resources reflects cgroup-actuated resources. If the container is running,
++			// it is populated from CRI status.
++			status.Resources = convertContainerStatusResources(allocatedContainer, status, cStatus, oldStatuses)
++			// status.AllocatedResources represents the desired cgroup resource state for resize,
++			// and is strictly based on the uninflated standard cgroup resources requested in the spec.
++			// DRA based allocations are not included in AllocatedResources at the container level.
++			// This is because the claims can be shared across containers in the pod and can be
++			// shared unevenly (enforced by the DRA driver).
++			status.AllocatedResources = allocatedContainer.Resources.Requests
++		}
++	}
++
++	if utilfeature.DefaultFeatureGate.Enabled(features.SupplementalGroupsPolicy) {
++		status.User = convertContainerStatusUser(cStatus)
++	}
++	if utilfeature.DefaultFeatureGate.Enabled(features.ContainerStopSignals) {
++		status.StopSignal = cStatus.StopSignal
++	}
++}
++
++// convertContainerStatus converts one runtime container status into an API
++// container status.
++func (kl *Kubelet) convertContainerStatus(ctx context.Context, pod *v1.Pod, cs *kubecontainer.Status, oldStatus *v1.ContainerStatus, imageVolumeNames sets.Set[string], podRestarting bool) *v1.ContainerStatus {
++	cid := cs.ID.String()
++	status := &v1.ContainerStatus{
++		Name:         cs.Name,
++		RestartCount: int32(cs.RestartCount),
++		Image:        cs.Image,
++		// Converting the digested image ref to the Kubernetes public
++		// ContainerStatus.ImageID is historically intentional and should
++		// not change.
++		ImageID:     cs.ImageRef,
++		ContainerID: cid,
++	}
++	if oldStatus != nil {
++		status.VolumeMounts = oldStatus.VolumeMounts // immutable
++		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
++			if oldStatus.RestartCount > status.RestartCount {
++				status.RestartCount = oldStatus.RestartCount
++			}
++			// Normal container restarts preserve the old container in the runtime so kubelet
++			// can query its termination status. RestartAllContainers removes old containers,
++			// so we must manually propagate LastTerminationState when the container ID changes.
++			if oldStatus.ContainerID != status.ContainerID && oldStatus.State.Terminated != nil {
++				status.LastTerminationState.Terminated = oldStatus.State.Terminated
++			} else if oldStatus.LastTerminationState.Terminated != nil {
++				status.LastTerminationState.Terminated = oldStatus.LastTerminationState.Terminated
++			}
++		}
++	}
++	if utilfeature.DefaultFeatureGate.Enabled(features.ImageVolumeWithDigest) && imageVolumeNames.Len() > 0 {
++		kl.setImageVolumeStatuses(ctx, pod, cs, status, imageVolumeNames)
++	}
++	setContainerState(status, cs, oldStatus, podRestarting)
++	return status
++}
++
++// setImageVolumeStatuses records the digest of every image volume mounted into
++// the container in its volume mount status.
++func (kl *Kubelet) setImageVolumeStatuses(ctx context.Context, pod *v1.Pod, cs *kubecontainer.Status, status *v1.ContainerStatus, imageVolumeNames sets.Set[string]) {
++	logger := klog.FromContext(ctx)
++	for i := range status.VolumeMounts {
++		volumeName := status.VolumeMounts[i].Name
++		if !imageVolumeNames.Has(volumeName) {
++			continue
++		}
++
++		imageSpec := imageVolumeSpec(cs, volumeName)
++		if imageSpec.Image == "" {
++			logger.Error(fmt.Errorf("image was not found"), "", "pod", pod.Name, "container", cs.Name, "volume", volumeName)
++			continue
++		}
++
++		imageRef, err := kl.containerRuntime.GetImageRef(ctx, imageSpec)
++		if err != nil {
++			logger.Error(err, "error getting image volume digest", "volume", volumeName)
++			continue
++		}
++		if status.VolumeMounts[i].VolumeStatus == nil {
++			status.VolumeMounts[i].VolumeStatus = &v1.VolumeStatus{}
++		}
++		if status.VolumeMounts[i].VolumeStatus.Image == nil {
++			status.VolumeMounts[i].VolumeStatus.Image = &v1.ImageVolumeStatus{}
++		}
++		status.VolumeMounts[i].VolumeStatus.Image.ImageRef = imageRef
++	}
++}
++
++// imageVolumeSpec returns the image spec of the image volume volumeName as the
++// runtime reports it, or an empty spec if the runtime does not report it.
++func imageVolumeSpec(cs *kubecontainer.Status, volumeName string) kubecontainer.ImageSpec {
++	for _, curVolumeMount := range cs.Mounts {
++		if curVolumeMount.Image == nil || curVolumeMount.Name != volumeName {
++			continue
++		}
++		return kuberuntime.ToKubeContainerImageSpec(&runtimeapi.Image{
++			Id:   curVolumeMount.Image.Image,
++			Spec: curVolumeMount.Image,
++		})
++	}
++	return kubecontainer.ImageSpec{}
++}
++
++// setContainerState sets the API state (Running, Waiting or Terminated) that
++// corresponds to the runtime state of the container.
++func setContainerState(status *v1.ContainerStatus, cs *kubecontainer.Status, oldStatus *v1.ContainerStatus, podRestarting bool) {
++	switch {
++	case cs.State == kubecontainer.ContainerStateRunning:
++		status.State.Running = &v1.ContainerStateRunning{StartedAt: metav1.NewTime(cs.StartedAt)}
++		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
++			if oldStatus != nil &&
++				oldStatus.State.Terminated != nil &&
++				oldStatus.RestartCount >= int32(cs.RestartCount) {
++				status.RestartCount = oldStatus.RestartCount + 1
++			}
++		}
++	case cs.State == kubecontainer.ContainerStateCreated:
++		// containers that are created but not running are "waiting to be running"
++		status.State.Waiting = &v1.ContainerStateWaiting{}
++	case cs.State == kubecontainer.ContainerStateExited:
++		status.State.Terminated = &v1.ContainerStateTerminated{
++			ExitCode:    int32(cs.ExitCode),
++			Reason:      cs.Reason,
++			Message:     cs.Message,
++			StartedAt:   metav1.NewTime(cs.StartedAt),
++			FinishedAt:  metav1.NewTime(cs.FinishedAt),
++			ContainerID: cs.ID.String(),
++		}
++
++	case cs.State == kubecontainer.ContainerStateUnknown &&
++		oldStatus != nil && // we have an old status
++		oldStatus.State.Running != nil: // our previous status was running
++
++		reason := kubecontainer.ContainerReasonStatusUnknown
++		// If the pod is restarting, the reason should be RestartingAllContainers
++		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) && podRestarting {
++			reason = RestartingAllContainers
++		}
++		// if this happens, then we know that this container was previously running and isn't anymore (assuming the CRI isn't failing to return running containers).
++		// you can imagine this happening in cases where a container failed and the kubelet didn't ask about it in time to see the result.
++		// in this case, the container should not to into waiting state immediately because that can make cases like runonce pods actually run
++		// twice. "container never ran" is different than "container ran and failed".  This is handled differently in the kubelet
++		// and it is handled differently in higher order logic like crashloop detection and handling
++		status.State.Terminated = &v1.ContainerStateTerminated{
++			Reason:   reason,
++			Message:  "The container could not be located when the pod was terminated",
++			ExitCode: 137, // this code indicates an error
++		}
++		// the restart count normally comes from the CRI (see convertContainerStatus), but since this is being added explicitly
++		// for the case where the CRI did not return a status, we need to manually increment the restart count to be accurate.
++		status.RestartCount = oldStatus.RestartCount + 1
++
++	default:
++		// this collapses any unknown state to container waiting.  If any container is waiting, then the pod status moves to pending even if it is running.
++		// if I'm reading this correctly, then any failure to read status on any container results in the entire pod going pending even if the containers
++		// are actually running.
++		// see https://github.com/kubernetes/kubernetes/blob/5d1b3e26af73dde33ecb6a3e69fb5876ceab192f/pkg/kubelet/kuberuntime/kuberuntime_container.go#L497 to
++		// https://github.com/kubernetes/kubernetes/blob/8976e3620f8963e72084971d9d4decbd026bf49f/pkg/kubelet/kuberuntime/helpers.go#L58-L71
++		// and interpreted here https://github.com/kubernetes/kubernetes/blob/b27e78f590a0d43e4a23ca3b2bf1739ca4c6e109/pkg/kubelet/kubelet_pods.go#L1434-L1439
++		status.State.Waiting = &v1.ContainerStateWaiting{}
++	}
++}
++
++// convertContainerStatusResources returns the resources to report in the status
++// of a container: the allocated resources, overwritten by what the runtime
++// reports for a running container.
++func convertContainerStatusResources(allocatedContainer *v1.Container, status *v1.ContainerStatus, cStatus *kubecontainer.Status, oldStatuses map[string]v1.ContainerStatus) *v1.ResourceRequirements {
++	cName := allocatedContainer.Name
++	// oldStatus should always exist if container is running
++	oldStatus, oldStatusFound := oldStatuses[cName]
++
++	// If the new status is missing resources, then if the container is running and previous
++	// status was also running, preserve the resources previously reported.
++	preserveOldResourcesValue := func(rName v1.ResourceName, oldStatusResource, resource v1.ResourceList) {
++		if cStatus.State == kubecontainer.ContainerStateRunning &&
++			oldStatusFound && oldStatus.State.Running != nil &&
++			status.ContainerID == oldStatus.ContainerID &&
++			oldStatusResource != nil {
++			if r, exists := oldStatusResource[rName]; exists {
++				resource[rName] = r.DeepCopy()
++			}
++		}
++	}
++
++	if cStatus.State != kubecontainer.ContainerStateRunning {
++		// If the container isn't running, just use the allocated resources.
++		return allocatedContainer.Resources.DeepCopy()
++	}
++	if oldStatus.Resources == nil {
++		oldStatus.Resources = &v1.ResourceRequirements{}
++	}
++
++	// Status resources default to the allocated resources.
++	// For non-running containers this will be the reported values.
++	// For non-resizable resources, these values will also be used.
++	resources := allocatedContainer.Resources.DeepCopy()
++	if resources.Limits != nil {
++		if cStatus.Resources != nil && cStatus.Resources.CPULimit != nil {
++			// If both the allocated & actual resources are at or below the minimum effective limit, preserve the
++			// allocated value in the API to avoid confusion and simplify comparisons.
++			if cStatus.Resources.CPULimit.MilliValue() > cm.MinMilliCPULimit ||
++				resources.Limits.Cpu().MilliValue() > cm.MinMilliCPULimit {
++				resources.Limits[v1.ResourceCPU] = cStatus.Resources.CPULimit.DeepCopy()
++			}
++		} else {
++			preserveOldResourcesValue(v1.ResourceCPU, oldStatus.Resources.Limits, resources.Limits)
++		}
++		if cStatus.Resources != nil && cStatus.Resources.MemoryLimit != nil {
++			resources.Limits[v1.ResourceMemory] = cStatus.Resources.MemoryLimit.DeepCopy()
++		} else {
++			preserveOldResourcesValue(v1.ResourceMemory, oldStatus.Resources.Limits, resources.Limits)
++		}
++	}
++	if resources.Requests != nil {
++		if cStatus.Resources != nil && cStatus.Resources.CPURequest != nil {
++			// If both the allocated & actual resources are at or below MinShares, preserve the
++			// allocated value in the API to avoid confusion and simplify comparisons.
++			if cStatus.Resources.CPURequest.MilliValue() > cm.MinShares ||
++				resources.Requests.Cpu().MilliValue() > cm.MinShares {
++				resources.Requests[v1.ResourceCPU] = cStatus.Resources.CPURequest.DeepCopy()
++			}
++		} else {
++			preserveOldResourcesValue(v1.ResourceCPU, oldStatus.Resources.Requests, resources.Requests)
++		}
++		if cStatus.Resources != nil && cStatus.Resources.MemoryRequest != nil {
++			resources.Requests[v1.ResourceMemory] = cStatus.Resources.MemoryRequest.DeepCopy()
++		} else {
++			preserveOldResourcesValue(v1.ResourceMemory, oldStatus.Resources.Requests, resources.Requests)
++		}
++	}
++
++	return resources
++}
++
++// convertContainerStatusUser converts the user identity reported by the runtime.
++func convertContainerStatusUser(cStatus *kubecontainer.Status) *v1.ContainerUser {
++	if cStatus.User == nil {
++		return nil
++	}
++
++	user := &v1.ContainerUser{}
++	if cStatus.User.Linux != nil {
++		user.Linux = &v1.LinuxContainerUser{
++			UID:                cStatus.User.Linux.UID,
++			GID:                cStatus.User.Linux.GID,
++			SupplementalGroups: cStatus.User.Linux.SupplementalGroups,
++		}
++	}
++
++	return user
++}
++
++// Step 4: containers that will be restarted.
++
++// applyRestartWaitingStatuses shows containers that the next pod sync will
++// restart as Waiting, with the reason of their last start failure.
++func (kl *Kubelet) applyRestartWaitingStatuses(logger klog.Logger, pod *v1.Pod, podStatus *kubecontainer.PodStatus, containers []v1.Container, statuses map[string]*v1.ContainerStatus, isInitContainer bool) {
++	for _, container := range containers {
++		if isInitContainer && initContainerDone(pod, podStatus, container, statuses[container.Name]) {
++			continue
++		}
++		// If a container should be restarted in next syncpod, it is *Waiting*.
++		if !kubecontainer.ShouldContainerBeRestarted(logger, &container, pod, podStatus) {
++			continue
++		}
++		status := statuses[container.Name]
++		reason, ok := kl.reasonCache.Get(pod.UID, container.Name)
++		if !ok {
++			// In fact, we could also apply Waiting state here, but it is less informative,
++			// and the container will be restarted soon, so we prefer the original state here.
++			// Note that with the current implementation of ShouldContainerBeRestarted the original state here
++			// could be:
++			//   * Waiting: There is no associated historical container and start failure reason record.
++			//   * Terminated: The container is terminated.
++			continue
++		}
++		if status.State.Terminated != nil {
++			status.LastTerminationState = status.State
++		}
++		status.State = v1.ContainerState{
++			Waiting: &v1.ContainerStateWaiting{
++				Reason:  reason.Err.Error(),
++				Message: reason.Message,
++			},
++		}
++	}
++}
++
++// initContainerDone reports whether an init container has completed and will
++// not be restarted. If the runtime no longer knows the container but the pod has
++// been initialized, it also marks the container as Completed.
++func initContainerDone(pod *v1.Pod, podStatus *kubecontainer.PodStatus, container v1.Container, status *v1.ContainerStatus) bool {
++	// If the init container is terminated with exit code 0, it won't be restarted.
++	// TODO(random-liu): Handle this in a cleaner way.
++	s := podStatus.FindContainerStatusByName(container.Name)
++	if s != nil && s.State == kubecontainer.ContainerStateExited && s.ExitCode == 0 {
++		return true
++	}
++	// When pod status is not persisted, init container status may be lost.
++	// This can occur in the following scenarios:
++	// 1. Static pods
++	// 2. Regular pods where init container status failed to sync to the API server
++	//    (e.g., due to control plane issues, though this is rare)
++	//
++	// In these cases, if the init container has already been removed from the runtime,
++	// kubelet cannot determine its status. However, we can infer that non-restartable
++	// init containers have completed successfully if regular containers have been created.
++	// Note: Restartable init containers (sidecars) should remain in waiting state and
++	// will be restarted by the kubelet.
++	isSidecar := container.RestartPolicy != nil && *container.RestartPolicy == v1.ContainerRestartPolicyAlways
++	if s == nil &&
++		kuberuntime.HasAnyRegularContainerCreated(pod, podStatus) &&
++		!isSidecar &&
++		status.State.Waiting != nil {
++		status.State = v1.ContainerState{
++			Terminated: &v1.ContainerStateTerminated{
++				Reason:   "Completed",
++				Message:  "Unable to get init container status from container runtime and pod has been initialized, treat it as exited normally",
++				ExitCode: 0,
++			},
++		}
++		return true
++	}
++	return false
++}
+diff --git a/pkg/kubelet/kubelet_pods.go b/pkg/kubelet/kubelet_pods.go
+index 29dc3eaa543..574a2c29742 100644
+--- a/pkg/kubelet/kubelet_pods.go
++++ b/pkg/kubelet/kubelet_pods.go
+@@ -62,7 +62,6 @@ import (
+ 	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
+ 	"k8s.io/kubernetes/pkg/kubelet/envvars"
+ 	"k8s.io/kubernetes/pkg/kubelet/images"
+-	"k8s.io/kubernetes/pkg/kubelet/kuberuntime"
+ 	"k8s.io/kubernetes/pkg/kubelet/metrics"
+ 	"k8s.io/kubernetes/pkg/kubelet/status"
+ 	kubetypes "k8s.io/kubernetes/pkg/kubelet/types"
+@@ -2308,217 +2307,14 @@ func (kl *Kubelet) convertToAPIPodLevelResourcesStatus(logger klog.Logger, alloc
+ 
+ // convertToAPIContainerStatuses converts the given internal container
+ // statuses into API container statuses.
++//
++// It works in four steps, each implemented in kubelet_container_status.go:
++//  1. every container starts from a default Waiting status, or from its previous status;
++//  2. containers that were running but disappeared from the runtime are shown as terminated;
++//  3. the statuses reported by the container runtime overwrite the defaults;
++//  4. containers that the next sync will restart are shown as Waiting.
+ func (kl *Kubelet) convertToAPIContainerStatuses(ctx context.Context, pod *v1.Pod, podStatus *kubecontainer.PodStatus, previousStatus []v1.ContainerStatus, containers []v1.Container, imageVolumeNames sets.Set[string], hasInitContainers, isInitContainer bool, podRestarting bool) []v1.ContainerStatus {
+ 	logger := klog.FromContext(ctx)
+-	convertContainerStatus := func(cs *kubecontainer.Status, oldStatus *v1.ContainerStatus) *v1.ContainerStatus {
+-		cid := cs.ID.String()
+-		status := &v1.ContainerStatus{
+-			Name:         cs.Name,
+-			RestartCount: int32(cs.RestartCount),
+-			Image:        cs.Image,
+-			// Converting the digested image ref to the Kubernetes public
+-			// ContainerStatus.ImageID is historically intentional and should
+-			// not change.
+-			ImageID:     cs.ImageRef,
+-			ContainerID: cid,
+-		}
+-		if oldStatus != nil {
+-			status.VolumeMounts = oldStatus.VolumeMounts // immutable
+-			if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
+-				if oldStatus.RestartCount > status.RestartCount {
+-					status.RestartCount = oldStatus.RestartCount
+-				}
+-				// Normal container restarts preserve the old container in the runtime so kubelet
+-				// can query its termination status. RestartAllContainers removes old containers,
+-				// so we must manually propagate LastTerminationState when the container ID changes.
+-				if oldStatus.ContainerID != status.ContainerID && oldStatus.State.Terminated != nil {
+-					status.LastTerminationState.Terminated = oldStatus.State.Terminated
+-				} else if oldStatus.LastTerminationState.Terminated != nil {
+-					status.LastTerminationState.Terminated = oldStatus.LastTerminationState.Terminated
+-				}
+-			}
+-		}
+-		if utilfeature.DefaultFeatureGate.Enabled(features.ImageVolumeWithDigest) && imageVolumeNames.Len() > 0 {
+-			for i := range status.VolumeMounts {
+-				volumeName := status.VolumeMounts[i].Name
+-				if !imageVolumeNames.Has(volumeName) {
+-					continue
+-				}
+-
+-				var imageSpec kubecontainer.ImageSpec
+-				for _, curVolumeMount := range cs.Mounts {
+-					if curVolumeMount.Image == nil || curVolumeMount.Name != volumeName {
+-						continue
+-					}
+-					imageSpec = kuberuntime.ToKubeContainerImageSpec(&runtimeapi.Image{
+-						Id:   curVolumeMount.Image.Image,
+-						Spec: curVolumeMount.Image,
+-					})
+-					break
+-				}
+-
+-				if imageSpec.Image == "" {
+-					logger.Error(fmt.Errorf("image was not found"), "", "pod", pod.Name, "container", cs.Name, "volume", volumeName)
+-					continue
+-				}
+-
+-				imageRef, err := kl.containerRuntime.GetImageRef(ctx, imageSpec)
+-				if err != nil {
+-					logger.Error(err, "error getting image volume digest", "volume", volumeName)
+-					continue
+-				}
+-				if status.VolumeMounts[i].VolumeStatus == nil {
+-					status.VolumeMounts[i].VolumeStatus = &v1.VolumeStatus{}
+-				}
+-				if status.VolumeMounts[i].VolumeStatus.Image == nil {
+-					status.VolumeMounts[i].VolumeStatus.Image = &v1.ImageVolumeStatus{}
+-				}
+-				status.VolumeMounts[i].VolumeStatus.Image.ImageRef = imageRef
+-			}
+-		}
+-
+-		switch {
+-		case cs.State == kubecontainer.ContainerStateRunning:
+-			status.State.Running = &v1.ContainerStateRunning{StartedAt: metav1.NewTime(cs.StartedAt)}
+-			if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) {
+-				if oldStatus != nil &&
+-					oldStatus.State.Terminated != nil &&
+-					oldStatus.RestartCount >= int32(cs.RestartCount) {
+-					status.RestartCount = oldStatus.RestartCount + 1
+-				}
+-			}
+-		case cs.State == kubecontainer.ContainerStateCreated:
+-			// containers that are created but not running are "waiting to be running"
+-			status.State.Waiting = &v1.ContainerStateWaiting{}
+-		case cs.State == kubecontainer.ContainerStateExited:
+-			status.State.Terminated = &v1.ContainerStateTerminated{
+-				ExitCode:    int32(cs.ExitCode),
+-				Reason:      cs.Reason,
+-				Message:     cs.Message,
+-				StartedAt:   metav1.NewTime(cs.StartedAt),
+-				FinishedAt:  metav1.NewTime(cs.FinishedAt),
+-				ContainerID: cid,
+-			}
+-
+-		case cs.State == kubecontainer.ContainerStateUnknown &&
+-			oldStatus != nil && // we have an old status
+-			oldStatus.State.Running != nil: // our previous status was running
+-
+-			reason := kubecontainer.ContainerReasonStatusUnknown
+-			// If the pod is restarting, the reason should be RestartingAllContainers
+-			if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) && podRestarting {
+-				reason = RestartingAllContainers
+-			}
+-			// if this happens, then we know that this container was previously running and isn't anymore (assuming the CRI isn't failing to return running containers).
+-			// you can imagine this happening in cases where a container failed and the kubelet didn't ask about it in time to see the result.
+-			// in this case, the container should not to into waiting state immediately because that can make cases like runonce pods actually run
+-			// twice. "container never ran" is different than "container ran and failed".  This is handled differently in the kubelet
+-			// and it is handled differently in higher order logic like crashloop detection and handling
+-			status.State.Terminated = &v1.ContainerStateTerminated{
+-				Reason:   reason,
+-				Message:  "The container could not be located when the pod was terminated",
+-				ExitCode: 137, // this code indicates an error
+-			}
+-			// the restart count normally comes from the CRI (see near the top of this method), but since this is being added explicitly
+-			// for the case where the CRI did not return a status, we need to manually increment the restart count to be accurate.
+-			status.RestartCount = oldStatus.RestartCount + 1
+-
+-		default:
+-			// this collapses any unknown state to container waiting.  If any container is waiting, then the pod status moves to pending even if it is running.
+-			// if I'm reading this correctly, then any failure to read status on any container results in the entire pod going pending even if the containers
+-			// are actually running.
+-			// see https://github.com/kubernetes/kubernetes/blob/5d1b3e26af73dde33ecb6a3e69fb5876ceab192f/pkg/kubelet/kuberuntime/kuberuntime_container.go#L497 to
+-			// https://github.com/kubernetes/kubernetes/blob/8976e3620f8963e72084971d9d4decbd026bf49f/pkg/kubelet/kuberuntime/helpers.go#L58-L71
+-			// and interpreted here https://github.com/kubernetes/kubernetes/blob/b27e78f590a0d43e4a23ca3b2bf1739ca4c6e109/pkg/kubelet/kubelet_pods.go#L1434-L1439
+-			status.State.Waiting = &v1.ContainerStateWaiting{}
+-		}
+-		return status
+-	}
+-
+-	convertContainerStatusResources := func(allocatedContainer *v1.Container, status *v1.ContainerStatus, cStatus *kubecontainer.Status, oldStatuses map[string]v1.ContainerStatus) *v1.ResourceRequirements {
+-		cName := allocatedContainer.Name
+-		// oldStatus should always exist if container is running
+-		oldStatus, oldStatusFound := oldStatuses[cName]
+-
+-		// If the new status is missing resources, then if the container is running and previous
+-		// status was also running, preserve the resources previously reported.
+-		preserveOldResourcesValue := func(rName v1.ResourceName, oldStatusResource, resource v1.ResourceList) {
+-			if cStatus.State == kubecontainer.ContainerStateRunning &&
+-				oldStatusFound && oldStatus.State.Running != nil &&
+-				status.ContainerID == oldStatus.ContainerID &&
+-				oldStatusResource != nil {
+-				if r, exists := oldStatusResource[rName]; exists {
+-					resource[rName] = r.DeepCopy()
+-				}
+-			}
+-		}
+-
+-		if cStatus.State != kubecontainer.ContainerStateRunning {
+-			// If the container isn't running, just use the allocated resources.
+-			return allocatedContainer.Resources.DeepCopy()
+-		}
+-		if oldStatus.Resources == nil {
+-			oldStatus.Resources = &v1.ResourceRequirements{}
+-		}
+-
+-		// Status resources default to the allocated resources.
+-		// For non-running containers this will be the reported values.
+-		// For non-resizable resources, these values will also be used.
+-		resources := allocatedContainer.Resources.DeepCopy()
+-		if resources.Limits != nil {
+-			if cStatus.Resources != nil && cStatus.Resources.CPULimit != nil {
+-				// If both the allocated & actual resources are at or below the minimum effective limit, preserve the
+-				// allocated value in the API to avoid confusion and simplify comparisons.
+-				if cStatus.Resources.CPULimit.MilliValue() > cm.MinMilliCPULimit ||
+-					resources.Limits.Cpu().MilliValue() > cm.MinMilliCPULimit {
+-					resources.Limits[v1.ResourceCPU] = cStatus.Resources.CPULimit.DeepCopy()
+-				}
+-			} else {
+-				preserveOldResourcesValue(v1.ResourceCPU, oldStatus.Resources.Limits, resources.Limits)
+-			}
+-			if cStatus.Resources != nil && cStatus.Resources.MemoryLimit != nil {
+-				resources.Limits[v1.ResourceMemory] = cStatus.Resources.MemoryLimit.DeepCopy()
+-			} else {
+-				preserveOldResourcesValue(v1.ResourceMemory, oldStatus.Resources.Limits, resources.Limits)
+-			}
+-		}
+-		if resources.Requests != nil {
+-			if cStatus.Resources != nil && cStatus.Resources.CPURequest != nil {
+-				// If both the allocated & actual resources are at or below MinShares, preserve the
+-				// allocated value in the API to avoid confusion and simplify comparisons.
+-				if cStatus.Resources.CPURequest.MilliValue() > cm.MinShares ||
+-					resources.Requests.Cpu().MilliValue() > cm.MinShares {
+-					resources.Requests[v1.ResourceCPU] = cStatus.Resources.CPURequest.DeepCopy()
+-				}
+-			} else {
+-				preserveOldResourcesValue(v1.ResourceCPU, oldStatus.Resources.Requests, resources.Requests)
+-			}
+-			if cStatus.Resources != nil && cStatus.Resources.MemoryRequest != nil {
+-				resources.Requests[v1.ResourceMemory] = cStatus.Resources.MemoryRequest.DeepCopy()
+-			} else {
+-				preserveOldResourcesValue(v1.ResourceMemory, oldStatus.Resources.Requests, resources.Requests)
+-			}
+-		}
+-
+-		return resources
+-	}
+-
+-	convertContainerStatusUser := func(cStatus *kubecontainer.Status) *v1.ContainerUser {
+-		if cStatus.User == nil {
+-			return nil
+-		}
+-
+-		user := &v1.ContainerUser{}
+-		if cStatus.User.Linux != nil {
+-			user.Linux = &v1.LinuxContainerUser{
+-				UID:                cStatus.User.Linux.UID,
+-				GID:                cStatus.User.Linux.GID,
+-				SupplementalGroups: cStatus.User.Linux.SupplementalGroups,
+-			}
+-		}
+-
+-		return user
+-	}
+ 
+ 	// Fetch old containers statuses from old pod status.
+ 	oldStatuses := make(map[string]v1.ContainerStatus, len(containers))
+@@ -2526,268 +2322,11 @@ func (kl *Kubelet) convertToAPIContainerStatuses(ctx context.Context, pod *v1.Po
+ 		oldStatuses[status.Name] = status
+ 	}
+ 
+-	// Set all container statuses to default waiting state
+-	statuses := make(map[string]*v1.ContainerStatus, len(containers))
+-	defaultWaitingState := v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: ContainerCreating}}
+-	if hasInitContainers {
+-		defaultWaitingState = v1.ContainerState{Waiting: &v1.ContainerStateWaiting{Reason: PodInitializing}}
+-	}
+-
+ 	supportsRRO := kl.runtimeClassSupportsRecursiveReadOnlyMounts(logger, pod)
+-
+-	for _, container := range containers {
+-		status := &v1.ContainerStatus{
+-			Name:  container.Name,
+-			Image: container.Image,
+-			State: defaultWaitingState,
+-		}
+-		// status.VolumeMounts cannot be propagated from kubecontainer.Status
+-		// because the CRI API is unaware of the volume names.
+-		if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
+-			for _, vol := range container.VolumeMounts {
+-				volStatus := v1.VolumeMountStatus{
+-					Name:      vol.Name,
+-					MountPath: vol.MountPath,
+-					ReadOnly:  vol.ReadOnly,
+-				}
+-				if vol.ReadOnly {
+-					rroMode := v1.RecursiveReadOnlyDisabled
+-					if b, err := resolveRecursiveReadOnly(vol, supportsRRO); err != nil {
+-						logger.Error(err, "failed to resolve recursive read-only mode", "mode", *vol.RecursiveReadOnly)
+-					} else if b {
+-						if utilfeature.DefaultFeatureGate.Enabled(features.RecursiveReadOnlyMounts) {
+-							rroMode = v1.RecursiveReadOnlyEnabled
+-						} else {
+-							logger.Error(nil, "recursive read-only mount needs feature gate to be enabled",
+-								"featureGate", features.RecursiveReadOnlyMounts)
+-						}
+-					}
+-					volStatus.RecursiveReadOnly = &rroMode // Disabled or Enabled
+-				}
+-				status.VolumeMounts = append(status.VolumeMounts, volStatus)
+-			}
+-		}
+-		oldStatus, found := oldStatuses[container.Name]
+-		if found {
+-			if oldStatus.State.Terminated != nil {
+-				status = &oldStatus
+-			} else {
+-				// Apply some values from the old statuses as the default values.
+-				status.RestartCount = oldStatus.RestartCount
+-				status.LastTerminationState = oldStatus.LastTerminationState
+-			}
+-		}
+-		statuses[container.Name] = status
+-	}
+-
+-	for _, container := range containers {
+-		found := false
+-		for _, cStatus := range podStatus.ContainerStatuses {
+-			if container.Name == cStatus.Name {
+-				found = true
+-				break
+-			}
+-		}
+-		if found {
+-			continue
+-		}
+-		// if no container is found, then assuming it should be waiting seems plausible, but the status code requires
+-		// that a previous termination be present.  If we're offline long enough or something removed the container, then
+-		// the previous termination may not be present.  This next code block ensures that if the container was previously running
+-		// then when that container status disappears, we can infer that it terminated even if we don't know the status code.
+-		// By setting the lasttermination state we are able to leave the container status waiting and present more accurate
+-		// data via the API.
+-
+-		oldStatus, ok := oldStatuses[container.Name]
+-		if !ok {
+-			continue
+-		}
+-
+-		// If the container is missing, RestartAllContainers in place, and previous status is not waiting, then the container
+-		// is removed from runtime. It should be considered Waiting. The LastTerminationState should have a "RestartingAllContainers"
+-		// reason to avoid confusion when containers are restarted.
+-		if utilfeature.DefaultFeatureGate.Enabled(features.RestartAllContainersOnContainerExits) && podRestarting && oldStatus.State.Waiting == nil {
+-			status := statuses[container.Name]
+-			status.State.Waiting = &v1.ContainerStateWaiting{
+-				Reason:  RestartingAllContainers,
+-				Message: "The container is removed because RestartAllContainers in place",
+-			}
+-			status.State.Terminated = nil
+-			status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
+-				Reason:   RestartingAllContainers,
+-				Message:  "The container is removed because RestartAllContainers in place",
+-				ExitCode: 137,
+-			}
+-			status.RestartCount = oldStatus.RestartCount + 1
+-			statuses[container.Name] = status
+-			continue
+-		}
+-
+-		if oldStatus.State.Terminated != nil {
+-			// if the old container status was terminated, the lasttermination status is correct
+-			continue
+-		}
+-		if oldStatus.State.Running == nil {
+-			// if the old container status isn't running, then waiting is an appropriate status and we have nothing to do
+-			continue
+-		}
+-
+-		// If we're here, we know the pod was previously running, but doesn't have a terminated status. We will check now to
+-		// see if it's in a pending state.
+-		status := statuses[container.Name]
+-		// If the status we're about to write indicates the default, the Waiting status will force this pod back into Pending.
+-		// That isn't true, we know the pod was previously running.
+-		isDefaultWaitingStatus := status.State.Waiting != nil && status.State.Waiting.Reason == ContainerCreating
+-		if hasInitContainers {
+-			isDefaultWaitingStatus = status.State.Waiting != nil && status.State.Waiting.Reason == PodInitializing
+-		}
+-		if !isDefaultWaitingStatus {
+-			// the status was written, don't override
+-			continue
+-		}
+-		if status.LastTerminationState.Terminated != nil {
+-			// if we already have a termination state, nothing to do
+-			continue
+-		}
+-
+-		// setting this value ensures that we show as stopped here, not as waiting:
+-		// https://github.com/kubernetes/kubernetes/blob/90c9f7b3e198e82a756a68ffeac978a00d606e55/pkg/kubelet/kubelet_pods.go#L1440-L1445
+-		// This prevents the pod from becoming pending
+-		status.LastTerminationState.Terminated = &v1.ContainerStateTerminated{
+-			Reason:   kubecontainer.ContainerReasonStatusUnknown,
+-			Message:  "The container could not be located when the pod was deleted.  The container used to be Running",
+-			ExitCode: 137,
+-		}
+-
+-		// If the pod was not deleted, then it's been restarted. Increment restart count.
+-		if pod.DeletionTimestamp == nil {
+-			status.RestartCount += 1
+-		}
+-
+-		statuses[container.Name] = status
+-	}
+-
+-	// Copy the slice before sorting it
+-	containerStatusesCopy := make([]*kubecontainer.Status, len(podStatus.ContainerStatuses))
+-	copy(containerStatusesCopy, podStatus.ContainerStatuses)
+-
+-	// Make the latest container status comes first.
+-	sort.Sort(sort.Reverse(kubecontainer.SortContainerStatusesByCreationTime(containerStatusesCopy)))
+-	// Set container statuses according to the statuses seen in pod status
+-	containerSeen := map[string]int{}
+-	for _, cStatus := range containerStatusesCopy {
+-		cName := cStatus.Name
+-		if _, ok := statuses[cName]; !ok {
+-			// This would also ignore the infra container.
+-			continue
+-		}
+-		if containerSeen[cName] >= 2 {
+-			continue
+-		}
+-		var oldStatusPtr *v1.ContainerStatus
+-		if oldStatus, ok := oldStatuses[cName]; ok {
+-			oldStatusPtr = &oldStatus
+-		}
+-		status := convertContainerStatus(cStatus, oldStatusPtr)
+-		if !utilfeature.DefaultFeatureGate.Enabled(features.ChangeContainerStatusOnKubeletRestart) {
+-			if cStatus.State == kubecontainer.ContainerStateRunning {
+-				if oldStatus, ok := oldStatuses[status.Name]; ok && oldStatus.Started != nil {
+-					status.Started = oldStatus.Started
+-				}
+-			}
+-		}
+-
+-		if utilfeature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+-			allocatedContainer := kubecontainer.GetContainerSpec(pod, cName)
+-			if allocatedContainer != nil {
+-				// status.Resources reflects cgroup-actuated resources. If the container is running,
+-				// it is populated from CRI status.
+-				status.Resources = convertContainerStatusResources(allocatedContainer, status, cStatus, oldStatuses)
+-				// status.AllocatedResources represents the desired cgroup resource state for resize,
+-				// and is strictly based on the uninflated standard cgroup resources requested in the spec.
+-				// DRA based allocations are not included in AllocatedResources at the container level.
+-				// This is because the claims can be shared across containers in the pod and can be
+-				// shared unevenly (enforced by the DRA driver).
+-				status.AllocatedResources = allocatedContainer.Resources.Requests
+-			}
+-		}
+-
+-		if utilfeature.DefaultFeatureGate.Enabled(features.SupplementalGroupsPolicy) {
+-			status.User = convertContainerStatusUser(cStatus)
+-		}
+-		if utilfeature.DefaultFeatureGate.Enabled(features.ContainerStopSignals) {
+-			status.StopSignal = cStatus.StopSignal
+-		}
+-
+-		if containerSeen[cName] == 0 {
+-			statuses[cName] = status
+-		} else {
+-			statuses[cName].LastTerminationState = status.State
+-		}
+-		containerSeen[cName] = containerSeen[cName] + 1
+-	}
+-
+-	// Handle the containers failed to be started, which should be in Waiting state.
+-	for _, container := range containers {
+-		if isInitContainer {
+-			// If the init container is terminated with exit code 0, it won't be restarted.
+-			// TODO(random-liu): Handle this in a cleaner way.
+-			s := podStatus.FindContainerStatusByName(container.Name)
+-			if s != nil && s.State == kubecontainer.ContainerStateExited && s.ExitCode == 0 {
+-				continue
+-			}
+-			// When pod status is not persisted, init container status may be lost.
+-			// This can occur in the following scenarios:
+-			// 1. Static pods
+-			// 2. Regular pods where init container status failed to sync to the API server
+-			//    (e.g., due to control plane issues, though this is rare)
+-			//
+-			// In these cases, if the init container has already been removed from the runtime,
+-			// kubelet cannot determine its status. However, we can infer that non-restartable
+-			// init containers have completed successfully if regular containers have been created.
+-			// Note: Restartable init containers (sidecars) should remain in waiting state and
+-			// will be restarted by the kubelet.
+-			isSidecar := container.RestartPolicy != nil && *container.RestartPolicy == v1.ContainerRestartPolicyAlways
+-			if s == nil &&
+-				kuberuntime.HasAnyRegularContainerCreated(pod, podStatus) &&
+-				!isSidecar &&
+-				statuses[container.Name].State.Waiting != nil {
+-				statuses[container.Name].State = v1.ContainerState{
+-					Terminated: &v1.ContainerStateTerminated{
+-						Reason:   "Completed",
+-						Message:  "Unable to get init container status from container runtime and pod has been initialized, treat it as exited normally",
+-						ExitCode: 0,
+-					},
+-				}
+-				continue
+-			}
+-		}
+-		// If a container should be restarted in next syncpod, it is *Waiting*.
+-		if !kubecontainer.ShouldContainerBeRestarted(logger, &container, pod, podStatus) {
+-			continue
+-		}
+-		status := statuses[container.Name]
+-		reason, ok := kl.reasonCache.Get(pod.UID, container.Name)
+-		if !ok {
+-			// In fact, we could also apply Waiting state here, but it is less informative,
+-			// and the container will be restarted soon, so we prefer the original state here.
+-			// Note that with the current implementation of ShouldContainerBeRestarted the original state here
+-			// could be:
+-			//   * Waiting: There is no associated historical container and start failure reason record.
+-			//   * Terminated: The container is terminated.
+-			continue
+-		}
+-		if status.State.Terminated != nil {
+-			status.LastTerminationState = status.State
+-		}
+-		status.State = v1.ContainerState{
+-			Waiting: &v1.ContainerStateWaiting{
+-				Reason:  reason.Err.Error(),
+-				Message: reason.Message,
+-			},
+-		}
+-		statuses[container.Name] = status
+-	}
++	statuses := defaultContainerStatuses(logger, containers, oldStatuses, hasInitContainers, supportsRRO)
++	inferMissingContainerTerminations(pod, podStatus, containers, oldStatuses, statuses, hasInitContainers, podRestarting)
++	kl.applyRuntimeContainerStatuses(ctx, pod, podStatus, oldStatuses, statuses, imageVolumeNames, podRestarting)
++	kl.applyRestartWaitingStatuses(logger, pod, podStatus, containers, statuses, isInitContainer)
+ 
+ 	// Sort the container statuses since clients of this interface expect the list
+ 	// of containers in a pod has a deterministic order.
+-- 
+2.56.0
+

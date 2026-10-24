@@ -1,0 +1,111 @@
+From e85a2a36c42a33646a30a797ca136d1849ad37c5 Mon Sep 17 00:00:00 2001
+From: MrDenn <den.shaikhatarov@gmail.com>
+Date: Fri, 16 Oct 2026 17:47:59 +0200
+Subject: [PATCH 2/2] kubelet: unit tests for volumeMountStatuses and
+ imageVolumeSpec
+
+Capstone 2IRR80 team 7 demonstration (not for upstream). Both helpers
+can be tested without a test Kubelet after the previous commit.
+---
+ pkg/kubelet/kubelet_container_status_test.go | 89 ++++++++++++++++++++
+ 1 file changed, 89 insertions(+)
+ create mode 100644 pkg/kubelet/kubelet_container_status_test.go
+
+diff --git a/pkg/kubelet/kubelet_container_status_test.go b/pkg/kubelet/kubelet_container_status_test.go
+new file mode 100644
+index 00000000000..85872f1204e
+--- /dev/null
++++ b/pkg/kubelet/kubelet_container_status_test.go
+@@ -0,0 +1,89 @@
++/*
++Copyright 2026 The Kubernetes Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package kubelet
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++
++	v1 "k8s.io/api/core/v1"
++	runtimeapi "k8s.io/cri-api/pkg/apis/runtime/v1"
++	"k8s.io/klog/v2"
++	kubecontainer "k8s.io/kubernetes/pkg/kubelet/container"
++	"k8s.io/utils/ptr"
++)
++
++func TestVolumeMountStatuses(t *testing.T) {
++	disabled, enabled := v1.RecursiveReadOnlyDisabled, v1.RecursiveReadOnlyEnabled
++	tests := []struct {
++		name        string
++		mount       v1.VolumeMount
++		supportsRRO bool
++		want        v1.VolumeMountStatus
++	}{
++		{
++			name:  "read-write mount has no recursive read-only mode",
++			mount: v1.VolumeMount{Name: "data", MountPath: "/data"},
++			want:  v1.VolumeMountStatus{Name: "data", MountPath: "/data"},
++		},
++		{
++			name:  "read-only mount without a mode is disabled",
++			mount: v1.VolumeMount{Name: "data", MountPath: "/data", ReadOnly: true},
++			want:  v1.VolumeMountStatus{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: &disabled},
++		},
++		{
++			name:        "IfPossible is enabled when the runtime supports it",
++			mount:       v1.VolumeMount{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: ptr.To(v1.RecursiveReadOnlyIfPossible)},
++			supportsRRO: true,
++			want:        v1.VolumeMountStatus{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: &enabled},
++		},
++		{
++			name:  "IfPossible is disabled when the runtime does not support it",
++			mount: v1.VolumeMount{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: ptr.To(v1.RecursiveReadOnlyIfPossible)},
++			want:  v1.VolumeMountStatus{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: &disabled},
++		},
++		{
++			name:  "Enabled without runtime support is an error and reported as disabled",
++			mount: v1.VolumeMount{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: ptr.To(v1.RecursiveReadOnlyEnabled)},
++			want:  v1.VolumeMountStatus{Name: "data", MountPath: "/data", ReadOnly: true, RecursiveReadOnly: &disabled},
++		},
++	}
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			container := v1.Container{VolumeMounts: []v1.VolumeMount{tc.mount}}
++			got := volumeMountStatuses(klog.Background(), container, tc.supportsRRO)
++			assert.Equal(t, []v1.VolumeMountStatus{tc.want}, got)
++		})
++	}
++
++	t.Run("container without mounts has no mount statuses", func(t *testing.T) {
++		assert.Nil(t, volumeMountStatuses(klog.Background(), v1.Container{}, true))
++	})
++}
++
++func TestImageVolumeSpec(t *testing.T) {
++	cs := &kubecontainer.Status{Mounts: []kubecontainer.Mount{
++		{Name: "config"},
++		{Name: "other-image", Image: &runtimeapi.ImageSpec{Image: "sha256:other"}},
++		{Name: "image", Image: &runtimeapi.ImageSpec{Image: "sha256:image"}},
++	}}
++
++	assert.Equal(t, "sha256:image", imageVolumeSpec(cs, "image").Image)
++	assert.Empty(t, imageVolumeSpec(cs, "config").Image, "mount without an image")
++	assert.Empty(t, imageVolumeSpec(cs, "missing").Image, "mount that the runtime does not report")
++}
+-- 
+2.56.0
+
